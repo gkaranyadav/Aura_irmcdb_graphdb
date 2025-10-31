@@ -1,33 +1,26 @@
-# app.py - IrMC AURA with Neo4j GraphDB + Groq LLM + Voice (Full Features)
+# app.py - IrMC AURA with Neo4j GraphDB + Groq (Fixed Neo4j Connection)
 import streamlit as st
 import tempfile
 import os
 import re
-import time
-import numpy as np
+import io
 from PyPDF2 import PdfReader
 import pytesseract
 from PIL import Image
 import pdf2image
 from neo4j import GraphDatabase
-import spacy
-from sentence_transformers import SentenceTransformer
-import faiss
 import groq
 import speech_recognition as sr
 from gtts import gTTS
-import io
-from streamlit.components.v1 import html
 
 # --------------------------------------------------------------------------------------
 # CONFIG
 class Config:
-    EMBEDDING_MODEL = "sentence-transformers/all-mpnet-base-v2"
-    TOP_K_CHUNKS = 5
     CHUNK_SIZE = 1000
     MIN_PARAGRAPH_LENGTH = 50
 
 class Neo4jConfig:
+    # FIX: Use bolt:// or neo4j+s:// instead of https://
     URI = st.secrets.get("NEO4J_URI", "bolt://localhost:7687")
     USERNAME = st.secrets.get("NEO4J_USERNAME", "neo4j")
     PASSWORD = st.secrets.get("NEO4J_PASSWORD", "password")
@@ -45,8 +38,15 @@ class Neo4jService:
     
     def connect(self):
         try:
+            # Fix URI format if needed
+            uri = Neo4jConfig.URI
+            if uri.startswith('https://'):
+                uri = uri.replace('https://', 'bolt://')
+            elif uri.startswith('http://'):
+                uri = uri.replace('http://', 'bolt://')
+            
             self.driver = GraphDatabase.driver(
-                Neo4jConfig.URI,
+                uri,
                 auth=(Neo4jConfig.USERNAME, Neo4jConfig.PASSWORD)
             )
             with self.driver.session() as session:
@@ -66,23 +66,36 @@ class Neo4jService:
                 session.run("MATCH (d:Document {name: $name}) DETACH DELETE d", name=document_name)
                 
                 # Create Document node
-                session.run("CREATE (d:Document {name: $name, upload_date: datetime()})", name=document_name)
+                session.run("CREATE (d:Document {name: $name})", name=document_name)
                 
                 # Create Pages and Paragraphs
                 for page_num, page_data in pages_data.items():
                     session.run("""
                     MATCH (d:Document {name: $doc_name})
-                    CREATE (p:Page {number: $page_num, preview: $preview})
+                    CREATE (p:Page {number: $page_num})
                     CREATE (d)-[:HAS_PAGE]->(p)
-                    """, doc_name=document_name, page_num=page_num, preview=page_data['preview'][:200] + "...")
+                    """, doc_name=document_name, page_num=page_num)
                     
                     # Create Paragraph nodes
                     for para_idx, paragraph in enumerate(page_data['paragraphs']):
+                        # Extract simple entities using regex
+                        entities = self._extract_simple_entities(paragraph)
+                        
                         session.run("""
                         MATCH (p:Page {number: $page_num})<-[:HAS_PAGE]-(d:Document {name: $doc_name})
                         CREATE (para:Paragraph {content: $content, chunk_id: $chunk_id})
                         CREATE (p)-[:HAS_PARAGRAPH]->(para)
-                        """, doc_name=document_name, page_num=page_num, content=paragraph, chunk_id=f"page_{page_num}_para_{para_idx}")
+                        """, doc_name=document_name, page_num=page_num, 
+                           content=paragraph, chunk_id=f"page_{page_num}_para_{para_idx}")
+                        
+                        # Create entity relationships
+                        for entity in entities:
+                            session.run("""
+                            MERGE (e:Entity {name: $name, type: $type})
+                            WITH e
+                            MATCH (para:Paragraph {chunk_id: $chunk_id})
+                            MERGE (para)-[:MENTIONS]->(e)
+                            """, name=entity['name'], type=entity['type'], chunk_id=f"page_{page_num}_para_{para_idx}")
                 
                 st.sidebar.success(f"✅ Graph created for {document_name}")
                 return True
@@ -91,73 +104,25 @@ class Neo4jService:
             st.error(f"❌ Graph creation failed: {str(e)}")
             return False
     
-    def extract_and_link_entities(self, document_name, pages_data):
-        if not self.driver:
-            return False
-            
-        try:
-            # Load spaCy model
-            try:
-                nlp = spacy.load("en_core_web_sm")
-            except OSError:
-                st.error("❌ Download spaCy model: python -m spacy download en_core_web_sm")
-                return False
-            
-            with self.driver.session() as session:
-                for page_num, page_data in pages_data.items():
-                    for para_idx, paragraph in enumerate(page_data['paragraphs']):
-                        # Extract entities using spaCy
-                        doc = nlp(paragraph)
-                        
-                        for ent in doc.ents:
-                            entity_type = self._map_entity_type(ent.label_)
-                            if entity_type in ["PERSON", "ORG", "GPE", "TECH"]:
-                                # Create Entity node
-                                session.run("MERGE (e:Entity {name: $name, type: $type})", name=ent.text, type=entity_type)
-                                
-                                # Link to Paragraph
-                                session.run("""
-                                MATCH (para:Paragraph {chunk_id: $chunk_id})
-                                MATCH (e:Entity {name: $name, type: $type})
-                                MERGE (para)-[:MENTIONS_ENTITY]->(e)
-                                """, chunk_id=f"page_{page_num}_para_{para_idx}", name=ent.text, type=entity_type)
-                        
-                        # Extract concepts
-                        concepts = self._extract_concepts(paragraph)
-                        for concept in concepts:
-                            session.run("MERGE (c:Concept {name: $name})", name=concept)
-                            session.run("""
-                            MATCH (para:Paragraph {chunk_id: $chunk_id})
-                            MATCH (c:Concept {name: $name})
-                            MERGE (para)-[:MENTIONS_CONCEPT]->(c)
-                            """, chunk_id=f"page_{page_num}_para_{para_idx}", name=concept)
-                
-                st.sidebar.success("✅ Entities and concepts extracted")
-                return True
-                
-        except Exception as e:
-            st.error(f"❌ Entity extraction failed: {str(e)}")
-            return False
-    
-    def _map_entity_type(self, spacy_label):
-        mapping = {
-            "PERSON": "PERSON", "ORG": "ORG", "GPE": "GPE",
-            "PRODUCT": "TECH", "WORK_OF_ART": "CONCEPT"
+    def _extract_simple_entities(self, text):
+        """Simple entity extraction using regex patterns"""
+        entities = []
+        
+        # Patterns for common entities
+        patterns = {
+            'PERSON': r'\b[A-Z][a-z]+ [A-Z][a-z]+\b',
+            'ORG': r'\b[A-Z][a-zA-Z]+ (?:Inc|Corp|Company|Ltd)\b',
+            'TECH': r'\b(?:AI|ML|Machine Learning|Artificial Intelligence|Neural Network|Deep Learning)\b',
+            'CONCEPT': r'\b[A-Z][a-z]+(?: [A-Z][a-z]+)*\b'
         }
-        return mapping.get(spacy_label, "OTHER")
-    
-    def _extract_concepts(self, text):
-        concepts = []
-        patterns = [
-            r'\b[A-Z][a-z]*(?:\s+[A-Z][a-z]*)*\s+[A-Z][a-z]*(?:\s+[A-Z][a-z]*)*\b',
-            r'\b(?:AI|ML|Machine Learning|Artificial Intelligence|Neural Network|Deep Learning|Transformer|GPT|LLM)\b'
-        ]
         
-        for pattern in patterns:
+        for entity_type, pattern in patterns.items():
             matches = re.findall(pattern, text)
-            concepts.extend([match.strip() for match in matches if len(match) > 3])
+            for match in matches:
+                if len(match) > 3:
+                    entities.append({"name": match, "type": entity_type})
         
-        return list(set(concepts))[:5]
+        return entities[:8]
     
     def search_relationships(self, query_terms, document_name):
         if not self.driver:
@@ -219,24 +184,20 @@ class Neo4jService:
                 MATCH (d:Document {name: $doc_name})
                 OPTIONAL MATCH (d)-[:HAS_PAGE]->(p:Page)
                 OPTIONAL MATCH (p)-[:HAS_PARAGRAPH]->(para:Paragraph)
-                OPTIONAL MATCH (para)-[:MENTIONS_ENTITY]->(e:Entity)
-                OPTIONAL MATCH (para)-[:MENTIONS_CONCEPT]->(c:Concept)
+                OPTIONAL MATCH (para)-[:MENTIONS]->(e:Entity)
                 RETURN 
                     count(p) AS page_count,
                     count(para) AS paragraph_count,
-                    count(DISTINCT e) AS entity_count,
-                    count(DISTINCT c) AS concept_count
+                    count(DISTINCT e) AS entity_count
                 """, doc_name=document_name).single()
                 
                 return {
-                    "pages": stats["page_count"],
-                    "paragraphs": stats["paragraph_count"],
-                    "entities": stats["entity_count"],
-                    "concepts": stats["concept_count"]
+                    "pages": stats["page_count"] or 0,
+                    "paragraphs": stats["paragraph_count"] or 0,
+                    "entities": stats["entity_count"] or 0
                 }
         except Exception as e:
-            st.error(f"❌ Graph stats failed: {str(e)}")
-            return {}
+            return {"pages": 0, "paragraphs": 0, "entities": 0}
 
 # --------------------------------------------------------------------------------------
 # GROQ LLM SERVICE
@@ -257,19 +218,14 @@ class GroqService:
         if not document_name:
             return self._no_info_response(question), 0.0
             
-        # Extract key terms from question
         query_terms = self._extract_query_terms(question)
-        
-        # Search relationships in Neo4j
         relationship_data = self.neo4j.search_relationships(query_terms, document_name)
         
         if not relationship_data:
             return self._no_info_response(question), 0.0
         
-        # Calculate confidence
         confidence = min(len(relationship_data) / 5.0, 1.0)
         
-        # Generate answer using Groq
         if self.client:
             return self._groq_analysis(question, relationship_data, confidence)
         else:
@@ -310,19 +266,8 @@ class GroqService:
     def _fallback_analysis(self, relationship_data, confidence):
         answer = "**Based on document relationships:**\n\n"
         
-        # Group by relationship type
-        direct_mentions = [item for item in relationship_data if item['type'] == 'DIRECT_MENTION']
-        relationships = [item for item in relationship_data if item['type'] == 'RELATIONSHIP']
-        
-        if direct_mentions:
-            answer += "**Key Mentions:**\n"
-            for item in direct_mentions[:3]:
-                answer += f"• {item['concept']} (Page {item['page']})\n"
-        
-        if relationships:
-            answer += "\n**Relationships Found:**\n"
-            for item in relationships[:2]:
-                answer += f"• {item['concept']} (Page {item['page']})\n"
+        for i, item in enumerate(relationship_data[:3], 1):
+            answer += f"{i}. **Page {item['page']}** ({item['type']}): {item['content'][:200]}...\n\n"
         
         return answer + self._format_graph_sources(relationship_data), confidence
 
@@ -330,28 +275,25 @@ class GroqService:
         if not relationship_data:
             return ""
             
-        sources = "\n\n**🔗 Relationship Sources:**\n"
+        sources = "\n\n**🔗 Sources:**\n"
         for i, item in enumerate(relationship_data[:3], 1):
-            sources += f"{i}. Page {item['page']} | {item['type']} | {item['concept']}\n"
+            sources += f"{i}. Page {item['page']} | {item['type']}\n"
         return sources
 
     def _no_info_response(self, question):
-        return f"No relationship information found for '{question}'. Try asking about specific concepts or entities.", 0.0
+        return f"No relationship information found for '{question}'. Try asking about specific concepts.", 0.0
 
     def analyze_document_overview(self, document_name):
         stats = self.neo4j.get_graph_statistics(document_name)
-        if not stats:
-            return "No graph data available."
-            
+        
         overview = f"""
 **📊 Graph Overview - {document_name}**
 
 - **Pages**: {stats.get('pages', 0)}
 - **Paragraphs**: {stats.get('paragraphs', 0)}  
 - **Entities**: {stats.get('entities', 0)}
-- **Concepts**: {stats.get('concepts', 0)}
 
-**💡 Ask questions about relationships between concepts and entities!**
+**💡 Ask questions about relationships between concepts!**
         """
         return overview
 
@@ -364,6 +306,9 @@ class VoiceService:
     def text_to_speech(self, text):
         """Convert text to speech using gTTS"""
         try:
+            # Limit text length for audio
+            text = text[:1000] + "..." if len(text) > 1000 else text
+            
             tts = gTTS(text=text, lang='en', slow=False)
             audio_file = io.BytesIO()
             tts.write_to_fp(audio_file)
@@ -378,8 +323,8 @@ class VoiceService:
         try:
             with sr.Microphone() as source:
                 st.info("🎤 Listening... Speak now!")
-                self.recognizer.adjust_for_ambient_noise(source)
-                audio = self.recognizer.listen(source, timeout=10)
+                self.recognizer.adjust_for_ambient_noise(source, duration=1)
+                audio = self.recognizer.listen(source, timeout=10, phrase_time_limit=15)
                 
             text = self.recognizer.recognize_google(audio)
             return text
@@ -416,8 +361,6 @@ class DocumentProcessor:
             success = self.neo4j.create_document_graph(uploaded_file.name, pages_data)
             
             if success:
-                # Extract entities and relationships
-                self.neo4j.extract_and_link_entities(uploaded_file.name, pages_data)
                 return len(pages_data)
             else:
                 return 0
